@@ -59,6 +59,7 @@ export const fetchTodos = async (): Promise<TodoType[]> => {
         createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
         updatedAt: t.updatedAt ? new Date(t.updatedAt) : new Date(),
         userId: t.userId,
+        userName: t.userName,
         deleted: t.deleted ?? false
       }))
     },

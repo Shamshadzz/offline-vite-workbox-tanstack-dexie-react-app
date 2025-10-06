@@ -4,7 +4,8 @@ export interface Todo {
   id: string
   text: string
   completed: boolean
-  userId?: number
+  userId?: string
+  userName?: string
   version: number
   createdAt?: Date
   updatedAt?: Date
@@ -30,4 +31,21 @@ export interface ConflictInfo {
   localVersion: Todo
   serverVersion: Todo
   conflictType: 'content' | 'deletion' | 'version'
+  localUser?: string
+  serverUser?: string
+  conflictTimestamp: Date
+}
+
+export interface User {
+  id: string
+  name: string
+  color: string
+}
+
+export interface ConflictResolution {
+  todoId: string
+  resolution: 'local' | 'server' | 'merge'
+  resolvedTodo?: Todo
+  resolvedBy: string
+  resolvedAt: Date
 }

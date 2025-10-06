@@ -22,11 +22,13 @@ const TodoSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     text: String,
     completed: Boolean,
-    userId: Number,
+    userId: String,
+    userName: String,
     version: { type: Number, default: 1 },
     createdAt: Date,
     updatedAt: Date,
-    synced: Boolean
+    synced: Boolean,
+    deleted: { type: Boolean, default: false }
 });
 
 const Todo = mongoose.model('Todo', TodoSchema);
@@ -61,11 +63,21 @@ app.post('/api/sync', async (req, res) => {
             if (op.type === 'CREATE') {
                 const existing = await Todo.findOne({ id: op.todo.id });
                 if (existing) {
-                    conflicts.push({
-                        op,
-                        reason: 'Already exists',
-                        type: 'DUPLICATE_CREATE'
-                    });
+                    // Check if it's a real conflict or just a duplicate sync
+                    if (existing.version >= op.todo.version) {
+                        // Server version is newer or same, no conflict
+                        results.push(existing);
+                        console.log(`✅ Todo already exists with newer version: ${op.todo.id}`);
+                    } else {
+                        conflicts.push({
+                            op,
+                            reason: 'Version conflict - server has newer version',
+                            type: 'VERSION_CONFLICT',
+                            serverVersion: existing,
+                            clientVersion: op.todo
+                        });
+                        console.log(`⚠️ Version conflict on todo: ${op.todo.id}`);
+                    }
                 } else {
                     const todo = new Todo(op.todo);
                     await todo.save();
@@ -77,25 +89,43 @@ app.post('/api/sync', async (req, res) => {
                 if (existing && existing.version > op.todo.version) {
                     conflicts.push({
                         op,
-                        reason: 'Version conflict',
+                        reason: 'Version conflict - server has newer version',
                         type: 'VERSION_CONFLICT',
-                        serverVersion: existing.version,
-                        clientVersion: op.todo.version
+                        serverVersion: existing,
+                        clientVersion: op.todo
                     });
                     console.log(`⚠️ Version conflict on todo: ${op.todo.id}`);
                 } else {
                     await Todo.updateOne(
                         { id: op.todo.id },
-                        { $set: op.todo },
+                        { $set: { ...op.todo, updatedAt: new Date() } },
                         { upsert: true }
                     );
                     results.push(op.todo);
                     console.log(`✅ Updated todo: ${op.todo.id}`);
                 }
             } else if (op.type === 'DELETE') {
-                await Todo.deleteOne({ id: op.todo.id });
-                results.push({ deleted: op.todo.id });
-                console.log(`✅ Deleted todo: ${op.todo.id}`);
+                const existing = await Todo.findOne({ id: op.todo.id });
+                if (existing) {
+                    // Convert delete into a tombstone: mark deleted=true, bump version and updatedAt
+                    existing.deleted = true;
+                    existing.version = (op.todo.version && op.todo.version > existing.version) ? op.todo.version : (existing.version + 1);
+                    existing.updatedAt = new Date();
+                    await existing.save();
+                    results.push(existing);
+                } else {
+                    // Create a tombstone if the record doesn't exist so clients can reconcile
+                    const tombstone = new Todo({
+                        ...op.todo,
+                        deleted: true,
+                        createdAt: op.todo.createdAt ? new Date(op.todo.createdAt) : new Date(),
+                        updatedAt: new Date(),
+                        version: op.todo.version || 1
+                    });
+                    await tombstone.save();
+                    results.push(tombstone);
+                }
+                console.log(`✅ Marked todo deleted (tombstone): ${op.todo.id}`);
             }
         } catch (error) {
             conflicts.push({

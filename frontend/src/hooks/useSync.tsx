@@ -1,14 +1,18 @@
 import { useEffect, useCallback, useState, useRef } from 'react'
 import { todoCollection } from '../collections/db'
 import { syncTodos, fetchTodos, checkHealth } from '../services/api'
-import { Todo as TodoType } from '../types/types'
+import { Todo as TodoType, ConflictInfo } from '../types/types'
 import { debounce } from '../utils/retryUtils'
+import { detectConflicts, mergeTodos } from '../utils/conflictResolver'
+import { getCurrentUser } from '../utils/userManager'
 
 export const useSync = () => {
   const [isOnline, setIsOnline] = useState(navigator.onLine)
   const [isSyncing, setIsSyncing] = useState(false)
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null)
   const [syncError, setSyncError] = useState<string | null>(null)
+  const [conflicts, setConflicts] = useState<ConflictInfo[]>([])
+  const [showConflictResolver, setShowConflictResolver] = useState(false)
   const syncQueueRef = useRef<Set<string>>(new Set())
 
   // Debounced sync to batch rapid changes
@@ -29,9 +33,9 @@ export const useSync = () => {
     setSyncError(null)
 
     try {
-      // Get all unsynced todos from collection
-      const table = todoCollection.utils.getTable(); // raw Dexie table
-      const allTodos = (await table.toArray()) as unknown as TodoType[];
+  // Get all unsynced todos from collection
+  const localTable = todoCollection.utils.getTable(); // raw Dexie table
+  const allTodos = (await localTable.toArray()) as unknown as TodoType[];
       const unsyncedTodos = allTodos.filter(t => !t.synced);
 
 
@@ -55,15 +59,60 @@ export const useSync = () => {
       // Sync to server
       const result = await syncTodos(operations)
 
-      // Mark todos as synced or remove deleted ones
-      for (const todo of unsyncedTodos) {
-        if (todo.deleted) {
-          // Remove deleted todos after successful sync
-          await todoCollection.delete(todo.id)
-        } else {
-          await todoCollection.update(todo.id, (draft) => {
-            draft.synced = true
-          })
+      // Apply server's canonical results (authoritative).
+      // The server may return full todo objects, tombstones (deleted flags),
+      // or simple { deleted: id } responses depending on its logic. Handle all cases.
+      const serverResults = result && Array.isArray(result.results) ? result.results : []
+
+  // Use the raw Dexie table for reliable upsert/delete operations
+  const serverTable = todoCollection.utils.getTable()
+
+      if (serverResults.length > 0) {
+        for (const r of serverResults) {
+          try {
+            // Case A: server returns a canonical todo object with deleted flag
+            if (r && (r.deleted === true || r.deleted === 'true')) {
+              const idToDelete = r.id || r.todo?.id || r.deleted
+              if (idToDelete) await serverTable.delete(idToDelete)
+              continue
+            }
+
+            // Case B: server returns an object like { deleted: '<id>' }
+            if (r && r.deleted && typeof r.deleted === 'string' && !r.id) {
+              await serverTable.delete(r.deleted)
+              continue
+            }
+
+            // Case C: server returns a full todo object (create/update)
+            if (r && r.id) {
+              const serverTodo = {
+                ...r,
+                createdAt: r.createdAt ? new Date(r.createdAt) : undefined,
+                updatedAt: r.updatedAt ? new Date(r.updatedAt) : new Date(),
+                synced: true,
+              }
+
+              // Upsert the canonical server version into local DB
+              await serverTable.put(serverTodo)
+              continue
+            }
+
+            // Fallback: if server returned something unexpected, ignore it but log
+            console.warn('Unexpected sync result item from server:', r)
+          } catch (err) {
+            console.error('Error applying server sync result for item', r, err)
+          }
+        }
+      } else {
+        // No per-item results returned -> fall back to optimistic behaviour
+        for (const todo of unsyncedTodos) {
+          if (todo.deleted) {
+            await todoCollection.delete(todo.id)
+          } else {
+            await todoCollection.update(todo.id, (draft) => {
+              draft.synced = true
+            })
+          }
         }
       }
 
@@ -87,7 +136,7 @@ export const useSync = () => {
     }
   }, [isOnline, isSyncing])
 
-  // Fetch fresh data from server
+  // Fetch fresh data from server with conflict detection
   const fetchFromServer = useCallback(async () => {
     if (!navigator.onLine) {
       console.log('fetchFromServer aborted: navigator reports offline')
@@ -102,8 +151,25 @@ export const useSync = () => {
       const table = todoCollection.utils.getTable();
       const localTodos = (await table.toArray()) as unknown as TodoType[];
 
-      console.log(`Fetched ${serverTodos.length} todos from server`);
+      // Get current user for conflict detection
+      const currentUser = getCurrentUser();
 
+      // Detect conflicts
+      const detectedConflicts = detectConflicts(
+        localTodos,
+        serverTodos,
+        currentUser.name,
+        'Server User'
+      );
+
+      if (detectedConflicts.length > 0) {
+        console.log(`Found ${detectedConflicts.length} conflicts`);
+        setConflicts(detectedConflicts);
+        setShowConflictResolver(true);
+        return; // Wait for user to resolve conflicts
+      }
+
+      // No conflicts, proceed with normal merge
       for (const serverTodo of serverTodos) {
         const localTodo = localTodos.find(t => t.id === serverTodo.id);
 
@@ -146,6 +212,37 @@ export const useSync = () => {
     syncQueueRef.current.add(todoId)
     debouncedSync()
   }, [debouncedSync])
+
+  // Handle conflict resolution
+  const handleConflictResolution = useCallback(async (resolution: any) => {
+    try {
+      // Apply the resolved todo to the collection
+      if (resolution.resolvedTodo) {
+        await todoCollection.update(resolution.todoId, () => resolution.resolvedTodo)
+      }
+
+      // Remove resolved conflict
+      setConflicts(prev => prev.filter(c => c.todoId !== resolution.todoId))
+      
+      // If all conflicts resolved, hide the resolver
+      if (conflicts.length <= 1) {
+        setShowConflictResolver(false)
+        setConflicts([])
+        // Continue with sync after resolving conflicts
+        setTimeout(() => {
+          fullSync()
+        }, 1000)
+      }
+    } catch (error) {
+      console.error('Error resolving conflict:', error)
+    }
+  }, [conflicts.length, fullSync])
+
+  // Dismiss conflict resolver
+  const dismissConflictResolver = useCallback(() => {
+    setShowConflictResolver(false)
+    setConflicts([])
+  }, [])
 
   // Handle online/offline events
   useEffect(() => {
@@ -232,9 +329,13 @@ export const useSync = () => {
     isSyncing,
     lastSyncTime,
     syncError,
+    conflicts,
+    showConflictResolver,
     syncToServer,
     fetchFromServer,
     fullSync,
-    queueForSync
+    queueForSync,
+    handleConflictResolution,
+    dismissConflictResolver
   }
 }

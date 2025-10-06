@@ -1,4 +1,4 @@
-import { Todo as TodoType } from '../types/types'
+import { Todo as TodoType, ConflictInfo, User } from '../types/types'
 
 export type ConflictResolutionStrategy = 
   | 'server-wins'
@@ -6,21 +6,22 @@ export type ConflictResolutionStrategy =
   | 'last-write-wins'
   | 'manual'
 
-export interface ConflictInfo {
-  todoId: string
-  localVersion: TodoType
-  serverVersion: TodoType
-  conflictType: 'content' | 'deletion' | 'version'
+export interface EnhancedConflictInfo extends ConflictInfo {
+  localUser?: string
+  serverUser?: string
+  conflictTimestamp: Date
 }
 
 /**
- * Detect conflicts between local and server versions
+ * Detect conflicts between local and server versions with user information
  */
 export function detectConflicts(
   localTodos: TodoType[],
-  serverTodos: TodoType[]
-): ConflictInfo[] {
-  const conflicts: ConflictInfo[] = []
+  serverTodos: TodoType[],
+  localUser?: string,
+  serverUser?: string
+): EnhancedConflictInfo[] {
+  const conflicts: EnhancedConflictInfo[] = []
 
   for (const localTodo of localTodos) {
     const serverTodo = serverTodos.find(t => t.id === localTodo.id)
@@ -39,7 +40,10 @@ export function detectConflicts(
           todoId: localTodo.id,
           localVersion: localTodo,
           serverVersion: serverTodo,
-          conflictType: 'deletion'
+          conflictType: 'deletion',
+          localUser,
+          serverUser,
+          conflictTimestamp: new Date()
         })
       } else if (
         localTodo.text !== serverTodo.text ||
@@ -49,14 +53,20 @@ export function detectConflicts(
           todoId: localTodo.id,
           localVersion: localTodo,
           serverVersion: serverTodo,
-          conflictType: 'content'
+          conflictType: 'content',
+          localUser,
+          serverUser,
+          conflictTimestamp: new Date()
         })
       } else if (localTodo.version < serverTodo.version) {
         conflicts.push({
           todoId: localTodo.id,
           localVersion: localTodo,
           serverVersion: serverTodo,
-          conflictType: 'version'
+          conflictType: 'version',
+          localUser,
+          serverUser,
+          conflictTimestamp: new Date()
         })
       }
     }
@@ -113,13 +123,15 @@ export function resolveConflict(
 export function mergeTodos(
   localTodos: TodoType[],
   serverTodos: TodoType[],
-  strategy: ConflictResolutionStrategy = 'last-write-wins'
+  strategy: ConflictResolutionStrategy = 'last-write-wins',
+  localUser?: string,
+  serverUser?: string
 ): {
   merged: TodoType[]
-  conflicts: ConflictInfo[]
+  conflicts: EnhancedConflictInfo[]
   resolutions: Map<string, TodoType>
 } {
-  const conflicts = detectConflicts(localTodos, serverTodos)
+  const conflicts = detectConflicts(localTodos, serverTodos, localUser, serverUser)
   const resolutions = new Map<string, TodoType>()
   const merged: TodoType[] = []
 

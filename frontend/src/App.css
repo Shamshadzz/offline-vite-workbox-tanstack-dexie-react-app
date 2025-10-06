@@ -1,10 +1,4 @@
-.App {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
-}
-
+/* Custom styles that work with Tailwind */
 .status-banner {
   position: fixed;
   top: 0;
@@ -26,35 +20,50 @@
   color: white;
 }
 
-.card {
-  padding: 2em;
-  margin-top: 2rem;
+/* Ensure buttons don't override Tailwind styles */
+.btn-icon {
+  padding: 0.75rem;
+  background-color: white;
+  border-radius: 9999px;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1),
+    0 4px 6px -2px rgba(0, 0, 0, 0.05);
+  transition: all 0.2s;
 }
 
-.info {
-  color: #888;
-  font-size: 0.9em;
-  margin-top: 2rem;
+.btn-icon:hover {
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+  transform: scale(1.05);
 }
 
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
+.btn-primary {
+  padding: 0.5rem 1rem;
+  background-color: #2563eb;
+  color: white;
+  border-radius: 0.5rem;
   font-weight: 500;
-  font-family: inherit;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  transition: border-color 0.25s;
+  transition: all 0.2s;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
 }
 
-button:hover {
-  border-color: #646cff;
+.btn-primary:hover {
+  background-color: #1d4ed8;
 }
 
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+/* Custom scrollbar for better UX */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
 }
