@@ -14,6 +14,7 @@ export const useSync = () => {
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([])
   const [showConflictResolver, setShowConflictResolver] = useState(false)
   const syncQueueRef = useRef<Set<string>>(new Set())
+  const bcRef = useRef<BroadcastChannel | null>(null)
 
   // Debounced sync to batch rapid changes
   const debouncedSync = useCallback(
@@ -68,6 +69,15 @@ export const useSync = () => {
   const serverTable = todoCollection.utils.getTable()
 
       if (serverResults.length > 0) {
+        // notify other tabs that a sync just happened so they can refresh
+        try {
+          if (!bcRef.current && typeof BroadcastChannel !== 'undefined') {
+            bcRef.current = new BroadcastChannel('todo-sync')
+          }
+        } catch (err) {
+          // BroadcastChannel may be unavailable in some environments
+        }
+
         for (const r of serverResults) {
           try {
             // Case A: server returns a canonical todo object with deleted flag
@@ -103,6 +113,16 @@ export const useSync = () => {
             console.error('Error applying server sync result for item', r, err)
           }
         }
+
+        // Broadcast that sync completed and send ids so other tabs can refresh
+        try {
+          const ids = serverResults.map((x: any) => x?.id).filter(Boolean)
+          if (bcRef.current && ids.length > 0) {
+            bcRef.current.postMessage({ type: 'synced', ids })
+          }
+        } catch (err) {
+          /* ignore */
+        }
       } else {
         // No per-item results returned -> fall back to optimistic behaviour
         for (const todo of unsyncedTodos) {
@@ -136,8 +156,10 @@ export const useSync = () => {
     }
   }, [isOnline, isSyncing])
 
+  // ...moved below to after fetchFromServer declaration
+
   // Fetch fresh data from server with conflict detection
-  const fetchFromServer = useCallback(async () => {
+  const fetchFromServer = useCallback(async (force = false) => {
     if (!navigator.onLine) {
       console.log('fetchFromServer aborted: navigator reports offline')
       return;
@@ -145,7 +167,7 @@ export const useSync = () => {
 
     try {
       const serverTodos = await fetchTodos();
-      console.log(`Fetched ${serverTodos.length} todos from server`);
+      console.log(`Fetched ${serverTodos.length} todos from server (force=${force})`);
 
       // Access raw Dexie table
       const table = todoCollection.utils.getTable();
@@ -154,33 +176,69 @@ export const useSync = () => {
       // Get current user for conflict detection
       const currentUser = getCurrentUser();
 
-      // Detect conflicts
-      const detectedConflicts = detectConflicts(
-        localTodos,
-        serverTodos,
-        currentUser.name,
-        'Server User'
-      );
+      // Detect conflicts only when not forcing server wins
+      if (!force) {
+        const detectedConflicts = detectConflicts(
+          localTodos,
+          serverTodos,
+          currentUser.name,
+          'Server User'
+        );
 
-      if (detectedConflicts.length > 0) {
-        console.log(`Found ${detectedConflicts.length} conflicts`);
-        setConflicts(detectedConflicts);
-        setShowConflictResolver(true);
-        return; // Wait for user to resolve conflicts
+        if (detectedConflicts.length > 0) {
+          console.log(`Found ${detectedConflicts.length} conflicts`);
+          setConflicts(detectedConflicts);
+          setShowConflictResolver(true);
+          return; // Wait for user to resolve conflicts
+        }
       }
 
-      // No conflicts, proceed with normal merge
-      for (const serverTodo of serverTodos) {
-        const localTodo = localTodos.find(t => t.id === serverTodo.id);
+      // Merge: if force=true, prefer server canonical copy and replace local table
+      // force = true
+      if (force) {
+        console.log('force=true: replacing local Dexie table with server items')
+        // Transform server items into DB-ready rows
+        const transformed = serverTodos.map((s: any) => ({
+          ...s,
+          createdAt: s.createdAt ? new Date(s.createdAt) : new Date(),
+          updatedAt: s.updatedAt ? new Date(s.updatedAt) : new Date(),
+          synced: true,
+        }))
 
-        if (!localTodo) {
-          await todoCollection.insert({ ...serverTodo, synced: true });
-        } else if (localTodo.synced) {
-          if (serverTodo.version > localTodo.version) {
-            await todoCollection.update(serverTodo.id, () => ({
-              ...serverTodo,
-              synced: true,
-            }));
+        try {
+          // Clear low-level table then insert via collection API so react-db
+          // change notifications fire and components update.
+          const table = todoCollection.utils.getTable()
+          await table.clear()
+          for (const item of transformed) {
+            try {
+              await todoCollection.insert(item)
+            } catch (e) {
+              // If insert fails for existing key, fall back to update
+              try { await todoCollection.update(item.id, () => item) } catch (err) { /* ignore */ }
+            }
+          }
+          console.log(`Replaced local DB with ${transformed.length} server items (via collection.insert)`)
+        } catch (err) {
+          console.error('Error replacing local DB during force fetch', err)
+        }
+      } else {
+        for (const serverTodo of serverTodos) {
+          const localTodo = localTodos.find(t => t.id === serverTodo.id);
+
+          if (!localTodo) {
+            await todoCollection.insert({ ...serverTodo, synced: true });
+          } else {
+            // Apply server if:
+            // - local is already synced and server has newer version
+            // - server has newer version than local
+            const shouldApply = localTodo.synced || serverTodo.version > (localTodo.version || 0);
+            if (shouldApply) {
+              await todoCollection.update(serverTodo.id, () => ({
+                ...serverTodo,
+                synced: true,
+              }));
+            }
           }
         }
       }
@@ -192,20 +250,63 @@ export const useSync = () => {
   }, [isOnline]);
 
   // Full sync: fetch then push
-  const fullSync = useCallback(async () => {
+  const fullSync = useCallback(async (forceFetch = false) => {
     if (!navigator.onLine || isSyncing) {
       console.log('fullSync aborted: offline or already syncing')
       return
     }
 
-    console.log('Starting full sync...')
+    console.log('Starting full sync...', { forceFetch })
     
-    // First, fetch latest from server
-    await fetchFromServer()
+    // First, fetch latest from server (optionally force server-win)
+    await fetchFromServer(forceFetch)
     
     // Then, push local changes
     await syncToServer()
   }, [isOnline, isSyncing, fetchFromServer, syncToServer])
+
+  // Create BroadcastChannel and visibility/focus listeners to refresh from server
+  useEffect(() => {
+    // Setup BroadcastChannel to react to syncs from other tabs
+    let bc: BroadcastChannel | null = null
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        bc = new BroadcastChannel('todo-sync')
+        bc.onmessage = (ev) => {
+          try {
+            if (ev.data?.type === 'synced' || ev.data?.type === 'invalidate') {
+              // Another tab synced — refresh local view from server
+              fetchFromServer()
+            }
+          } catch (e) {
+            console.error('BC message handler error', e)
+          }
+        }
+        bcRef.current = bc
+      }
+    } catch (err) {
+      // ignore if BroadcastChannel unsupported
+    }
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchFromServer()
+      }
+    }
+
+    const handleFocus = () => {
+      fetchFromServer()
+    }
+
+    document.addEventListener('visibilitychange', handleVisibility)
+    window.addEventListener('focus', handleFocus)
+
+    return () => {
+      try { bc?.close() } catch (e) { /* noop */ }
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [fetchFromServer])
 
   // Queue a todo for syncing
   const queueForSync = useCallback((todoId: string) => {

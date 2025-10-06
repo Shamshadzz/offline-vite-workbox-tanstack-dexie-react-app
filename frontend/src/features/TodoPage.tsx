@@ -35,8 +35,9 @@ export const TodoPage: React.FC = () => {
   const addTodo = () => {
     if (!newTodo.trim()) return;
     const now = new Date();
+    const id = crypto.randomUUID()
     todoCollection.insert({
-      id: crypto.randomUUID(),
+      id,
       text: newTodo.trim(),
       completed: false,
       version: 1,
@@ -48,12 +49,8 @@ export const TodoPage: React.FC = () => {
       userName: currentUser.name,
     });
     setNewTodo("");
-    // Trigger sync attempt (useful when returning online)
-    try {
-      window.dispatchEvent(new CustomEvent('force-sync'))
-    } catch (e) {
-      /* noop */
-    }
+    // Queue for sync (debounced)
+    try { queueForSync(id); console.log('Queued todo for sync', id) } catch (e) { try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
   };
 
   const toggleTodo = (todoRef: TodoType & { id: string }) => {

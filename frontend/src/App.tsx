@@ -21,30 +21,6 @@ function App() {
   const { fullSync } = useSync();
 
   useEffect(() => {
-    // Register service worker
-    // register({
-    //   onSuccess: () => {
-    //     console.log("App is ready for offline use");
-    //   },
-    //   onUpdate: (registration: ServiceWorkerRegistration) => {
-    //     console.log("New version available!");
-    //     setUpdateAvailable(true);
-    //     setSwRegistration(registration);
-    //   },
-    //   onOfflineReady: () => {
-    //     console.log("App is ready to work offline");
-    //   },
-    // });
-
-    // Listen for SW messages
-    const swMessageHandler = (data: any) => {
-      if (data?.type === "BACKGROUND_SYNC") {
-        console.log("Background sync triggered by SW");
-        window.dispatchEvent(new CustomEvent("force-sync"));
-      }
-    };
-    // listenForSWMessages(swMessageHandler);
-
     // Request persistent storage
     requestPersistentStorage();
 
@@ -64,11 +40,21 @@ function App() {
     };
   }, []);
 
-  // Initialize sync hook to register online/offline handlers and auto-sync
-  // This hook sets up background sync, periodic syncs and listens for force-sync events.
+  // Initialize sync once on mount. `useSync` already registers online/offline
+  // handlers and will trigger syncs when the connection is restored or when
+  // the app queues changes. Calling `fullSync` repeatedly (by including it
+  // in the dependency array) can trigger extra syncs because the callback
+  // identity may change as internal state updates. Call once at mount when
+  // online to bootstrap state.
   useEffect(() => {
-    fullSync();
-  }, [fullSync]);
+    if (navigator.onLine) {
+      // intentionally not including `fullSync` in deps to avoid repeated runs
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      // Force server-state on initial load to ensure Dexie reflects backend
+      fullSync(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
 
   const handleUpdateApp = () => {

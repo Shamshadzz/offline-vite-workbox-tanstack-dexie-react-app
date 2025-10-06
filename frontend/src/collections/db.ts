@@ -1,6 +1,6 @@
 import { createCollection } from '@tanstack/react-db'
 import { Todo as TodoInterface } from '../types/types'
-import { dexieCollectionOptions } from "tanstack-dexie-db-collection"
+import { dexieCollectionOptions, DexieUtils } from "tanstack-dexie-db-collection"
 import { Todo as TodoType } from '../types/types'
 import { z } from "zod"
 
@@ -31,6 +31,27 @@ export const todoCollection = createCollection({
     syncBatchSize: 100,
   }),
 })
+
+// function startTodoRefetchInterval() {
+//   setInterval(async () => {
+//     try {
+//       // Refetch data from server (and store into Dexie if fetch() is defined)
+//       const data = await todoCollection.utils.refresh();
+
+//       // ✅ Print the data returned by the server
+//       console.log("🔁 Refetched todos from server:", data);
+
+//       // ✅ (Optional) Check what’s stored locally in Dexie after refetch
+//       const localData = await todoCollection.utils.getTable().toArray();
+//       console.log("💾 Local Dexie data after refetch:", localData);
+
+//     } catch (err) {
+//       console.error("❌ Failed to refetch todos:", err);
+//     }
+//   }, 1_000); // every 30 seconds
+// }
+
+// startTodoRefetchInterval();
 
 // Batch sync function for efficient syncing
 export async function batchSyncTodos(mutations: Array<{
