@@ -118,16 +118,88 @@ self.addEventListener('activate', (event) => {
 // Background sync for when connection is restored
 self.addEventListener('sync', (event) => {
   if (event.tag === 'sync-todos') {
-    event.waitUntil(
-      // Notify the app to sync
-      self.clients.matchAll().then((clients) => {
-        clients.forEach((client) => {
-          client.postMessage({
-            type: 'BACKGROUND_SYNC',
-            tag: event.tag
+    event.waitUntil((async () => {
+      try {
+        // Open the same IndexedDB the client used for offline queue
+        const DB_NAME = 'todo-offline-queue'
+        const STORE_NAME = 'ops'
+
+        function openDB() {
+          return new Promise((resolve, reject) => {
+            const req = indexedDB.open(DB_NAME, 1)
+            req.onupgradeneeded = () => {
+              const db = req.result
+              if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+              }
+            }
+            req.onsuccess = () => resolve(req.result)
+            req.onerror = () => reject(req.error)
           })
+        }
+
+        const db = await openDB()
+        const tx = db.transaction(STORE_NAME, 'readonly')
+        const store = tx.objectStore(STORE_NAME)
+        const getAllReq = store.getAll()
+        const ops = await new Promise((resolve, reject) => {
+          getAllReq.onsuccess = () => resolve(getAllReq.result || [])
+          getAllReq.onerror = () => reject(getAllReq.error)
         })
-      })
-    )
+
+        if (!ops || ops.length === 0) {
+          db.close()
+          // still notify clients that sync happened (no ops)
+          const clients = await self.clients.matchAll()
+          clients.forEach(c => c.postMessage({ type: 'BACKGROUND_SYNC', tag: event.tag, results: [] }))
+          return
+        }
+
+        // Transform into operations array expected by server
+        const operations = ops.map(o => o.op)
+
+        // Attempt to POST to server
+        // Prefer absolute URL derived from location if possible
+        const apiUrl = (self.registration && self.registration.scope)
+          ? new URL('/api/sync', self.registration.scope).toString()
+          : '/api/sync'
+
+        const resp = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ operations })
+        })
+
+        if (!resp.ok) {
+          throw new Error('Sync POST failed with status ' + resp.status)
+        }
+
+        // If server accepted, clear the queue
+        db.close()
+        const db2 = await openDB()
+        const tx2 = db2.transaction(STORE_NAME, 'readwrite')
+        tx2.objectStore(STORE_NAME).clear()
+        await new Promise((resolve, reject) => {
+          tx2.oncomplete = () => { db2.close(); resolve() }
+          tx2.onerror = () => { db2.close(); reject(tx2.error) }
+        })
+
+        // Notify any open clients of the successful background sync
+        const clientsList = await self.clients.matchAll()
+        let respJson = null
+        try {
+          respJson = await resp.json()
+        } catch (e) {
+          respJson = null
+        }
+        clientsList.forEach((client) => {
+          client.postMessage({ type: 'BACKGROUND_SYNC', tag: event.tag, results: respJson })
+        })
+      } catch (err) {
+        console.error('Service worker background sync failed', err)
+        // Let the runtime retry the sync later
+        throw err
+      }
+    })())
   }
 })

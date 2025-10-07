@@ -10,6 +10,8 @@ import { SettingsPanel } from "./components/SettingsPanel";
 //   listenForSWMessages,
 // } from "./utils/serviceWorkerRegistration";
 import { useSync} from "./hooks/useSync";
+import { register, requestBackgroundSync, listenForSWMessages } from "./utils/serviceWorkerRegistration";
+import { todoCollection } from "./collections/db";
 import { requestPersistentStorage } from "./utils/storageManager";
 import { Settings } from "lucide-react";
 
@@ -18,7 +20,7 @@ function App() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [swRegistration, setSwRegistration] = useState<ServiceWorkerRegistration | null>(null);
 
-  const { fullSync } = useSync();
+  const { fullSync, fetchFromServer } = useSync();
 
   useEffect(() => {
     // Request persistent storage
@@ -39,6 +41,124 @@ function App() {
       // Optionally: remove SW message listener if listenForSWMessages supports it
     };
   }, []);
+
+  // Register service worker and listen for messages
+  useEffect(() => {
+    try {
+      register({
+        onSuccess: (registration) => {
+          setSwRegistration(registration)
+        },
+        onUpdate: (registration) => {
+          setSwRegistration(registration)
+          setUpdateAvailable(true)
+        }
+      })
+
+      // Listen for messages from the service worker
+      listenForSWMessages((data) => {
+        try {
+          if (!data) return
+          // SW asked the app to run a background sync (e.g. SW sync event)
+          if (data.type === 'BACKGROUND_SYNC') {
+            console.log('Received BACKGROUND_SYNC message from SW', data)
+            // SW already attempted to push operations to the server.
+            // Fetch canonical state so local DB reflects server's result.
+            fetchFromServer(true)
+          }
+        } catch (err) {
+          console.error('Error handling SW message', err)
+        }
+      })
+    } catch (err) {
+      console.warn('Service worker registration/listener skipped:', err)
+    }
+    // We intentionally do not include `fullSync` in deps to avoid repeated
+    // registrations of the SW listener; listenForSWMessages registers a
+    // global listener which is safe to call once at app startup.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // When offline and there are unsynced todos, ask the service worker to
+  // register a background sync so the SW can attempt to sync when the
+  // connection is restored (or the browser decides to run the sync).
+  useEffect(() => {
+    let pollTimer: number | undefined
+
+    const startPolling = () => {
+      if (!(window && 'serviceWorker' in navigator)) return
+
+      // Poll every 5 seconds while offline to detect unsynced items and
+      // request a background-sync registration (one-shot)
+      pollTimer = window.setInterval(async () => {
+        try {
+          if (navigator.onLine) return
+          const table = todoCollection.utils.getTable()
+          const all = await table.toArray()
+          const hasUnsynced = all.some((t: any) => !t.synced)
+          if (hasUnsynced) {
+            try {
+              await requestBackgroundSync('sync-todos')
+              console.log('Requested background sync (sync-todos)')
+            } catch (err) {
+              console.warn('Background sync request failed', err)
+            }
+            // We only need to register once for the current offline session
+            if (pollTimer) {
+              clearInterval(pollTimer)
+              pollTimer = undefined
+            }
+          }
+        } catch (err) {
+          console.error('Error while checking unsynced todos for SW sync', err)
+        }
+      }, 5000)
+    }
+
+    // Start polling only when offline
+    if (!navigator.onLine) startPolling()
+
+    const handleOffline = () => startPolling()
+    const handleOnline = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer)
+        pollTimer = undefined
+      }
+    }
+
+    window.addEventListener('offline', handleOffline)
+    window.addEventListener('online', handleOnline)
+
+    // Also try to register a background sync when the page is being closed
+    // so the SW has a chance to run the sync after the page unloads.
+    const handleBeforeUnload = async () => {
+      try {
+        const table = todoCollection.utils.getTable()
+        const all = await table.toArray()
+        const hasUnsynced = all.some((t: any) => !t.synced)
+        if (hasUnsynced) {
+          try {
+            await requestBackgroundSync('sync-todos')
+            console.log('Requested background sync on beforeunload')
+          } catch (err) {
+            console.warn('Background sync registration failed on unload', err)
+          }
+        }
+      } catch (err) {
+        /* swallow */
+      }
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
+    return () => {
+      if (pollTimer) clearInterval(pollTimer)
+      window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+    }
+    // Intentionally not listing todoCollection in deps; it's a stable import.
+  }, [])
 
   // Initialize sync once on mount. `useSync` already registers online/offline
   // handlers and will trigger syncs when the connection is restored or when

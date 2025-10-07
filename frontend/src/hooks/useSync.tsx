@@ -1,10 +1,12 @@
 import { useEffect, useCallback, useState, useRef } from 'react'
 import { todoCollection } from '../collections/db'
-import { syncTodos, fetchTodos, checkHealth } from '../services/api'
+import { fetchTodos, checkHealth } from '../services/api'
 import { Todo as TodoType, ConflictInfo } from '../types/types'
 import { debounce } from '../utils/retryUtils'
 import { detectConflicts, mergeTodos } from '../utils/conflictResolver'
 import { getCurrentUser } from '../utils/userManager'
+import offlineQueue from '../utils/offlineQueue'
+import { requestBackgroundSync } from '../utils/serviceWorkerRegistration'
 
 export const useSync = () => {
   const [isOnline, setIsOnline] = useState(navigator.onLine)
@@ -26,133 +28,28 @@ export const useSync = () => {
 
   // Sync unsynced todos to server
   const syncToServer = useCallback(async () => {
-    if (!navigator.onLine || isSyncing) {
-      return
-    }
-
-    setIsSyncing(true)
-    setSyncError(null)
-
+    // Delegate push sync to the service worker. Persisted operations are
+    // written to the offline queue by UI actions; here we only ensure the
+    // service worker has been requested to perform a background sync.
     try {
-  // Get all unsynced todos from collection
-  const localTable = todoCollection.utils.getTable(); // raw Dexie table
-  const allTodos = (await localTable.toArray()) as unknown as TodoType[];
-      const unsyncedTodos = allTodos.filter(t => !t.synced);
+      // Check if there are any unsynced todos first
+      const localTable = todoCollection.utils.getTable()
+      const allTodos = (await localTable.toArray()) as unknown as TodoType[]
+      const unsyncedTodos = allTodos.filter(t => !t.synced)
 
+      if (unsyncedTodos.length === 0) return
 
-      if (unsyncedTodos.length === 0) {
-        setIsSyncing(false)
-        return
+      // Request the SW to sync them when possible
+      try {
+        await requestBackgroundSync('sync-todos')
+        console.log('Requested background sync (sync-todos)')
+      } catch (err) {
+        console.warn('Background sync register failed (falling back to immediate fetch):', err)
+        // As a fallback, attempt to fetch latest from server
+        await fetchFromServer()
       }
-
-      console.log(`Syncing ${unsyncedTodos.length} todos to server...`)
-
-      // Prepare operations
-      const operations = unsyncedTodos.map((todo: TodoType) => ({
-        type: todo.deleted ? 'DELETE' : todo.version === 1 ? 'CREATE' : 'UPDATE',
-        todo: {
-          ...todo,
-          createdAt: todo.createdAt?.toISOString(),
-          updatedAt: todo.updatedAt?.toISOString()
-        }
-      }))
-
-      // Sync to server
-      const result = await syncTodos(operations)
-
-      // Apply server's canonical results (authoritative).
-      // The server may return full todo objects, tombstones (deleted flags),
-      // or simple { deleted: id } responses depending on its logic. Handle all cases.
-      const serverResults = result && Array.isArray(result.results) ? result.results : []
-
-  // Use the raw Dexie table for reliable upsert/delete operations
-  const serverTable = todoCollection.utils.getTable()
-
-      if (serverResults.length > 0) {
-        // notify other tabs that a sync just happened so they can refresh
-        try {
-          if (!bcRef.current && typeof BroadcastChannel !== 'undefined') {
-            bcRef.current = new BroadcastChannel('todo-sync')
-          }
-        } catch (err) {
-          // BroadcastChannel may be unavailable in some environments
-        }
-
-        for (const r of serverResults) {
-          try {
-            // Case A: server returns a canonical todo object with deleted flag
-            if (r && (r.deleted === true || r.deleted === 'true')) {
-              const idToDelete = r.id || r.todo?.id || r.deleted
-              if (idToDelete) await serverTable.delete(idToDelete)
-              continue
-            }
-
-            // Case B: server returns an object like { deleted: '<id>' }
-            if (r && r.deleted && typeof r.deleted === 'string' && !r.id) {
-              await serverTable.delete(r.deleted)
-              continue
-            }
-
-            // Case C: server returns a full todo object (create/update)
-            if (r && r.id) {
-              const serverTodo = {
-                ...r,
-                createdAt: r.createdAt ? new Date(r.createdAt) : undefined,
-                updatedAt: r.updatedAt ? new Date(r.updatedAt) : new Date(),
-                synced: true,
-              }
-
-              // Upsert the canonical server version into local DB
-              await serverTable.put(serverTodo)
-              continue
-            }
-
-            // Fallback: if server returned something unexpected, ignore it but log
-            console.warn('Unexpected sync result item from server:', r)
-          } catch (err) {
-            console.error('Error applying server sync result for item', r, err)
-          }
-        }
-
-        // Broadcast that sync completed and send ids so other tabs can refresh
-        try {
-          const ids = serverResults.map((x: any) => x?.id).filter(Boolean)
-          if (bcRef.current && ids.length > 0) {
-            bcRef.current.postMessage({ type: 'synced', ids })
-          }
-        } catch (err) {
-          /* ignore */
-        }
-      } else {
-        // No per-item results returned -> fall back to optimistic behaviour
-        for (const todo of unsyncedTodos) {
-          if (todo.deleted) {
-            await todoCollection.delete(todo.id)
-          } else {
-            await todoCollection.update(todo.id, (draft) => {
-              draft.synced = true
-            })
-          }
-        }
-      }
-
-      // Clear sync queue
-      syncQueueRef.current.clear()
-
-      setLastSyncTime(new Date())
-      console.log('Sync successful:', result)
-    } catch (error) {
-      console.error('Sync failed:', error)
-      setSyncError(error instanceof Error ? error.message : 'Sync failed')
-      
-      // Retry after delay if online
-      if (isOnline) {
-        setTimeout(() => {
-          syncToServer()
-        }, 10000) // Retry after 10 seconds
-      }
-    } finally {
-      setIsSyncing(false)
+    } catch (err) {
+      console.error('syncToServer delegate failed:', err)
     }
   }, [isOnline, isSyncing])
 
@@ -194,7 +91,7 @@ export const useSync = () => {
       }
 
       // Merge: if force=true, prefer server canonical copy and replace local table
-      // force = true
+      force = true
       if (force) {
         console.log('force=true: replacing local Dexie table with server items')
         // Transform server items into DB-ready rows

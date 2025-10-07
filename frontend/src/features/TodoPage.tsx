@@ -11,6 +11,8 @@ import { UserSwitcher } from "../components/UserSwitcher";
 import { useSync } from "../hooks/useSync";
 import { getCurrentUser } from "../utils/userManager";
 import { Clipboard } from "lucide-react";
+import offlineQueue from '../utils/offlineQueue'
+import { requestBackgroundSync } from '../utils/serviceWorkerRegistration'
 
 export const TodoPage: React.FC = () => {
   const [newTodo, setNewTodo] = useState("");
@@ -32,7 +34,7 @@ export const TodoPage: React.FC = () => {
     queueForSync
   } = useSync();
 
-  const addTodo = () => {
+  const addTodo = async () => {
     if (!newTodo.trim()) return;
     const now = new Date();
     const id = crypto.randomUUID()
@@ -49,11 +51,13 @@ export const TodoPage: React.FC = () => {
       userName: currentUser.name,
     });
     setNewTodo("");
-    // Queue for sync (debounced)
+    // Persist op to offline queue and request SW background sync
+    try { offlineQueue.addOperation({ type: 'CREATE', todo: { id, text: newTodo.trim() } }).catch(()=>{}) } catch(e){}
+    try { await requestBackgroundSync('sync-todos') } catch(e) { /* ignore */ }
     try { queueForSync(id); console.log('Queued todo for sync', id) } catch (e) { try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
   };
 
-  const toggleTodo = (todoRef: TodoType & { id: string }) => {
+  const toggleTodo = async (todoRef: TodoType & { id: string }) => {
     todoCollection.update(todoRef.id, (draft) => {
       draft.completed = !draft.completed;
       draft.version += 1;
@@ -62,6 +66,9 @@ export const TodoPage: React.FC = () => {
       draft.userId = currentUser.id;
       draft.userName = currentUser.name;
     });
+    // Save op for SW to pick up if app closed and ask SW to sync
+    try { offlineQueue.addOperation({ type: 'UPDATE', todo: { id: todoRef.id, completed: !todoRef.completed } }).catch(()=>{}) } catch(e){}
+    try { await requestBackgroundSync('sync-todos') } catch(e) { /* ignore */ }
     try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (e) { /* noop */ }
   };
 
@@ -76,6 +83,9 @@ export const TodoPage: React.FC = () => {
       draft.userId = currentUserLocal.id
       draft.userName = currentUserLocal.name
     })
+    // Persist delete op to offline queue too
+    try { offlineQueue.addOperation({ type: 'DELETE', todo: { id } }).catch(()=>{}) } catch(e){}
+    try { await requestBackgroundSync('sync-todos') } catch(e) { /* ignore */ }
     // Queue for sync (debounced) rather than forcing immediate sync event
     try { queueForSync(id) } catch (e) { /* fallback to force-sync */ try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
   };
@@ -91,6 +101,8 @@ export const TodoPage: React.FC = () => {
       draft.userId = currentUserLocal.id;
       draft.userName = currentUserLocal.name;
     });
+    try { offlineQueue.addOperation({ type: 'UPDATE', todo: { id, text: newText.trim() } }).catch(()=>{}) } catch(e){}
+    try { await requestBackgroundSync('sync-todos') } catch(e) { /* ignore */ }
     try { queueForSync(id) } catch (e) { try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
   }
 
