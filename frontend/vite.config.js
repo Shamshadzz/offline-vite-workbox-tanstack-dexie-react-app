@@ -7,6 +7,11 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
+      // 🔥 KEY FIX: Use your custom service worker
+      strategies: 'injectManifest',
+      srcDir: 'src',
+      filename: 'service-worker.js',
+
       registerType: 'autoUpdate',
       includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'masked-icon.svg'],
 
@@ -40,52 +45,16 @@ export default defineConfig({
         ]
       },
 
-      workbox: {
+      injectManifest: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+        // Tell Workbox where to inject the manifest
+        swSrc: 'src/service-worker.js',
+        swDest: 'dist/service-worker.js',
+        // This will replace self.__WB_MANIFEST with the actual file list
+        injectionPoint: 'self.__WB_MANIFEST',
 
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/drv418m7-5000\.inc1\.devtunnels\.ms\/api\/.*/i,
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'api-cache',
-              expiration: {
-                maxEntries: 50,
-                maxAgeSeconds: 5 * 60 // 5 minutes
-              },
-              cacheableResponse: {
-                statuses: [0, 200]
-              },
-              networkTimeoutSeconds: 10
-            }
-          },
-          {
-            urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp)$/,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'image-cache',
-              expiration: {
-                maxEntries: 60,
-                maxAgeSeconds: 30 * 24 * 60 * 60 // 30 days
-              }
-            }
-          },
-          {
-            urlPattern: /\.(?:js|css)$/,
-            handler: 'StaleWhileRevalidate',
-            options: {
-              cacheName: 'static-resources',
-              expiration: {
-                maxEntries: 60,
-                maxAgeSeconds: 7 * 24 * 60 * 60 // 7 days
-              }
-            }
-          }
-        ],
-
-        cleanupOutdatedCaches: true,
-        skipWaiting: true,
-        clientsClaim: true
+        // Additional Workbox config for injectManifest
+        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024, // 5MB
       },
 
       devOptions: {
