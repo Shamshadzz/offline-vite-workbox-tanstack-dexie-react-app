@@ -1,10 +1,11 @@
 import { useEffect, useCallback, useState, useRef } from 'react'
 import { todoCollection } from '../collections/db'
-import { syncTodos, fetchTodos, checkHealth } from '../services/api'
+import { fetchTodos, checkHealth, syncTodos } from '../services/api'
 import { Todo as TodoType, ConflictInfo } from '../types/types'
-import { debounce } from '../utils/retryUtils'
-import { detectConflicts, mergeTodos } from '../utils/conflictResolver'
+import { detectConflicts, resolveConflict } from '../utils/conflictResolver'
 import { getCurrentUser } from '../utils/userManager'
+import offlineQueue from '../utils/offlineQueue'
+import { requestBackgroundSync } from '../utils/serviceWorkerRegistration'
 
 export const useSync = () => {
   const [isOnline, setIsOnline] = useState(navigator.onLine)
@@ -13,41 +14,35 @@ export const useSync = () => {
   const [syncError, setSyncError] = useState<string | null>(null)
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([])
   const [showConflictResolver, setShowConflictResolver] = useState(false)
-  const syncQueueRef = useRef<Set<string>>(new Set())
+  const syncInProgressRef = useRef(false)
   const bcRef = useRef<BroadcastChannel | null>(null)
 
-  // Debounced sync to batch rapid changes
-  const debouncedSync = useCallback(
-    debounce(() => {
-      syncToServer()
-    }, 2000),
-    []
-  )
-
-  // Sync unsynced todos to server
+  // 🔥 FIX 1: Simplified sync to server - single source of truth
   const syncToServer = useCallback(async () => {
-    if (!navigator.onLine || isSyncing) {
+    // Prevent concurrent syncs
+    if (!navigator.onLine || syncInProgressRef.current) {
+      console.log('Sync skipped: offline or already syncing')
       return
     }
 
+    syncInProgressRef.current = true
     setIsSyncing(true)
     setSyncError(null)
 
     try {
-  // Get all unsynced todos from collection
-  const localTable = todoCollection.utils.getTable(); // raw Dexie table
-  const allTodos = (await localTable.toArray()) as unknown as TodoType[];
-      const unsyncedTodos = allTodos.filter(t => !t.synced);
-
+      const table = todoCollection.utils.getTable()
+      const allTodos = (await table.toArray()) as unknown as TodoType[]
+      const unsyncedTodos = allTodos.filter(t => !t.synced)
 
       if (unsyncedTodos.length === 0) {
+        console.log('No unsynced todos')
         setIsSyncing(false)
+        syncInProgressRef.current = false
         return
       }
 
-      console.log(`Syncing ${unsyncedTodos.length} todos to server...`)
+      console.log(`🔄 Syncing ${unsyncedTodos.length} todos to server...`)
 
-      // Prepare operations
       const operations = unsyncedTodos.map((todo: TodoType) => ({
         type: todo.deleted ? 'DELETE' : todo.version === 1 ? 'CREATE' : 'UPDATE',
         todo: {
@@ -57,246 +52,229 @@ export const useSync = () => {
         }
       }))
 
-      // Sync to server
       const result = await syncTodos(operations)
+      const serverResults = result?.results || []
 
-      // Apply server's canonical results (authoritative).
-      // The server may return full todo objects, tombstones (deleted flags),
-      // or simple { deleted: id } responses depending on its logic. Handle all cases.
-      const serverResults = result && Array.isArray(result.results) ? result.results : []
-
-  // Use the raw Dexie table for reliable upsert/delete operations
-  const serverTable = todoCollection.utils.getTable()
-
-      if (serverResults.length > 0) {
-        // notify other tabs that a sync just happened so they can refresh
+      // Apply server's canonical results
+      for (const r of serverResults) {
         try {
-          if (!bcRef.current && typeof BroadcastChannel !== 'undefined') {
-            bcRef.current = new BroadcastChannel('todo-sync')
+          if (r?.deleted === true || r?.deleted === 'true') {
+            const idToDelete = r.id || r.todo?.id
+            if (idToDelete) await table.delete(idToDelete)
+            continue
+          }
+
+          if (r?.deleted && typeof r.deleted === 'string' && !r.id) {
+            await table.delete(r.deleted)
+            continue
+          }
+
+          if (r?.id) {
+            const serverTodo = {
+              ...r,
+              createdAt: r.createdAt ? new Date(r.createdAt) : new Date(),
+              updatedAt: r.updatedAt ? new Date(r.updatedAt) : new Date(),
+              synced: true,
+            }
+            await table.put(serverTodo)
+            continue
           }
         } catch (err) {
-          // BroadcastChannel may be unavailable in some environments
-        }
-
-        for (const r of serverResults) {
-          try {
-            // Case A: server returns a canonical todo object with deleted flag
-            if (r && (r.deleted === true || r.deleted === 'true')) {
-              const idToDelete = r.id || r.todo?.id || r.deleted
-              if (idToDelete) await serverTable.delete(idToDelete)
-              continue
-            }
-
-            // Case B: server returns an object like { deleted: '<id>' }
-            if (r && r.deleted && typeof r.deleted === 'string' && !r.id) {
-              await serverTable.delete(r.deleted)
-              continue
-            }
-
-            // Case C: server returns a full todo object (create/update)
-            if (r && r.id) {
-              const serverTodo = {
-                ...r,
-                createdAt: r.createdAt ? new Date(r.createdAt) : undefined,
-                updatedAt: r.updatedAt ? new Date(r.updatedAt) : new Date(),
-                synced: true,
-              }
-
-              // Upsert the canonical server version into local DB
-              await serverTable.put(serverTodo)
-              continue
-            }
-
-            // Fallback: if server returned something unexpected, ignore it but log
-            console.warn('Unexpected sync result item from server:', r)
-          } catch (err) {
-            console.error('Error applying server sync result for item', r, err)
-          }
-        }
-
-        // Broadcast that sync completed and send ids so other tabs can refresh
-        try {
-          const ids = serverResults.map((x: any) => x?.id).filter(Boolean)
-          if (bcRef.current && ids.length > 0) {
-            bcRef.current.postMessage({ type: 'synced', ids })
-          }
-        } catch (err) {
-          /* ignore */
-        }
-      } else {
-        // No per-item results returned -> fall back to optimistic behaviour
-        for (const todo of unsyncedTodos) {
-          if (todo.deleted) {
-            await todoCollection.delete(todo.id)
-          } else {
-            await todoCollection.update(todo.id, (draft) => {
-              draft.synced = true
-            })
-          }
+          console.error('Error applying server result:', err)
         }
       }
 
-      // Clear sync queue
-      syncQueueRef.current.clear()
+      // Clear offline queue
+      await offlineQueue.clearAllOperations()
+
+      // Broadcast sync completion
+      if (bcRef.current) {
+        bcRef.current.postMessage({ type: 'synced', ids: serverResults.map((x: any) => x?.id).filter(Boolean) })
+      }
 
       setLastSyncTime(new Date())
-      console.log('Sync successful:', result)
+      console.log('✅ Sync successful')
     } catch (error) {
-      console.error('Sync failed:', error)
+      console.error('❌ Sync failed:', error)
       setSyncError(error instanceof Error ? error.message : 'Sync failed')
       
-      // Retry after delay if online
-      if (isOnline) {
-        setTimeout(() => {
-          syncToServer()
-        }, 10000) // Retry after 10 seconds
+      // Fallback to SW background sync
+      try {
+        await requestBackgroundSync('sync-todos')
+        console.log('📱 Requested SW background sync')
+      } catch (err) {
+        console.error('SW background sync registration failed', err)
       }
     } finally {
       setIsSyncing(false)
+      syncInProgressRef.current = false
     }
-  }, [isOnline, isSyncing])
+  }, [])
 
-  // ...moved below to after fetchFromServer declaration
-
-  // Fetch fresh data from server with conflict detection
-  const fetchFromServer = useCallback(async (force = false) => {
+  // 🔥 FIX 2: Fetch from server with proper conflict detection
+  const fetchFromServer = useCallback(async (forceServerWins = false) => {
     if (!navigator.onLine) {
-      console.log('fetchFromServer aborted: navigator reports offline')
-      return;
+      console.log('❌ Fetch aborted: offline')
+      return
     }
 
     try {
-      const serverTodos = await fetchTodos();
-      console.log(`Fetched ${serverTodos.length} todos from server (force=${force})`);
+      const serverTodos = await fetchTodos()
+      console.log(`📥 Fetched ${serverTodos.length} todos from server`)
 
-      // Access raw Dexie table
-      const table = todoCollection.utils.getTable();
-      const localTodos = (await table.toArray()) as unknown as TodoType[];
+      const table = todoCollection.utils.getTable()
+      const localTodos = (await table.toArray()) as unknown as TodoType[]
+      const currentUser = getCurrentUser()
 
-      // Get current user for conflict detection
-      const currentUser = getCurrentUser();
-
-      // Detect conflicts only when not forcing server wins
-      if (!force) {
+      // 🔥 FIX 3: Only detect conflicts if NOT forcing server wins AND have unsynced data
+      const hasUnsyncedLocal = localTodos.some(t => !t.synced)
+      
+      if (!forceServerWins && hasUnsyncedLocal) {
         const detectedConflicts = detectConflicts(
           localTodos,
           serverTodos,
           currentUser.name,
-          'Server User'
-        );
+          'Server'
+        )
 
         if (detectedConflicts.length > 0) {
-          console.log(`Found ${detectedConflicts.length} conflicts`);
-          setConflicts(detectedConflicts);
-          setShowConflictResolver(true);
-          return; // Wait for user to resolve conflicts
+          console.log(`⚠️ Found ${detectedConflicts.length} conflicts`)
+          setConflicts(detectedConflicts)
+          setShowConflictResolver(true)
+          return // Wait for user resolution
         }
       }
 
-      // Merge: if force=true, prefer server canonical copy and replace local table
-      // force = true
-      if (force) {
-        console.log('force=true: replacing local Dexie table with server items')
-        // Transform server items into DB-ready rows
-        const transformed = serverTodos.map((s: any) => ({
-          ...s,
-          createdAt: s.createdAt ? new Date(s.createdAt) : new Date(),
-          updatedAt: s.updatedAt ? new Date(s.updatedAt) : new Date(),
-          synced: true,
-        }))
-
-        try {
-          // Clear low-level table then insert via collection API so react-db
-          // change notifications fire and components update.
-          const table = todoCollection.utils.getTable()
-          await table.clear()
-          for (const item of transformed) {
-            try {
-              await todoCollection.insert(item)
-            } catch (e) {
-              // If insert fails for existing key, fall back to update
-              try { await todoCollection.update(item.id, () => item) } catch (err) { /* ignore */ }
-            }
+      // 🔥 FIX 4: Smart merge - only overwrite synced items or when forcing
+      if (forceServerWins) {
+        console.log('🔄 Force mode: replacing with server data')
+        await table.clear()
+        
+        for (const serverTodo of serverTodos) {
+          const transformed = {
+            ...serverTodo,
+            createdAt: serverTodo.createdAt ? new Date(serverTodo.createdAt) : new Date(),
+            updatedAt: serverTodo.updatedAt ? new Date(serverTodo.updatedAt) : new Date(),
+            synced: true,
           }
-          console.log(`Replaced local DB with ${transformed.length} server items (via collection.insert)`)
-        } catch (err) {
-          console.error('Error replacing local DB during force fetch', err)
+          await table.put(transformed)
         }
       } else {
+        // Merge intelligently
+        const localMap = new Map(localTodos.map(t => [t.id, t]))
+        
         for (const serverTodo of serverTodos) {
-          const localTodo = localTodos.find(t => t.id === serverTodo.id);
-
+          const localTodo = localMap.get(serverTodo.id)
+          
           if (!localTodo) {
-            await todoCollection.insert({ ...serverTodo, synced: true });
-          } else {
-            // Apply server if:
-            // - local is already synced and server has newer version
-            // - server has newer version than local
-            const shouldApply = localTodo.synced || serverTodo.version > (localTodo.version || 0);
-            if (shouldApply) {
-              await todoCollection.update(serverTodo.id, () => ({
-                ...serverTodo,
-                synced: true,
-              }));
-            }
+            // New from server
+            await table.put({ 
+              ...serverTodo,
+              createdAt: serverTodo.createdAt ? new Date(serverTodo.createdAt) : new Date(),
+              updatedAt: serverTodo.updatedAt ? new Date(serverTodo.updatedAt) : new Date(),
+              synced: true 
+            })
+          } else if (localTodo.synced) {
+            // Local is synced, safe to update with server version
+            await table.put({
+              ...serverTodo,
+              createdAt: serverTodo.createdAt ? new Date(serverTodo.createdAt) : new Date(),
+              updatedAt: serverTodo.updatedAt ? new Date(serverTodo.updatedAt) : new Date(),
+              synced: true
+            })
           }
+          // If local is unsynced, keep local version (will sync later)
         }
       }
 
-      console.log('Fetch from server complete');
+      console.log('✅ Fetch complete')
     } catch (error) {
-      console.error('Fetch failed:', error);
+      console.error('❌ Fetch failed:', error)
     }
-  }, [isOnline]);
+  }, [])
 
-  // Full sync: fetch then push
+  // 🔥 FIX 5: Simplified full sync
   const fullSync = useCallback(async (forceFetch = false) => {
-    if (!navigator.onLine || isSyncing) {
-      console.log('fullSync aborted: offline or already syncing')
+    if (!navigator.onLine || syncInProgressRef.current) {
+      console.log('Full sync skipped: offline or syncing')
       return
     }
 
-    console.log('Starting full sync...', { forceFetch })
+    console.log('🔄 Starting full sync...')
     
-    // First, fetch latest from server (optionally force server-win)
-    await fetchFromServer(forceFetch)
-    
-    // Then, push local changes
+    // First push local changes
     await syncToServer()
-  }, [isOnline, isSyncing, fetchFromServer, syncToServer])
+    
+    // Then fetch server updates
+    await fetchFromServer(forceFetch)
+  }, [syncToServer, fetchFromServer])
 
-  // Create BroadcastChannel and visibility/focus listeners to refresh from server
+  // 🔥 FIX 6: Handle conflict resolution properly
+  const handleConflictResolution = useCallback(async (resolution: any) => {
+    try {
+      const conflict = conflicts.find(c => c.todoId === resolution.todoId)
+      if (!conflict) return
+
+      let resolvedTodo: TodoType
+
+      if (resolution.resolution === 'local') {
+        resolvedTodo = resolveConflict(conflict, 'client-wins')
+      } else if (resolution.resolution === 'server') {
+        resolvedTodo = resolveConflict(conflict, 'server-wins')
+      } else {
+        resolvedTodo = resolution.resolvedTodo || resolveConflict(conflict, 'last-write-wins')
+      }
+
+      // Apply resolution
+      await todoCollection.update(resolution.todoId, () => resolvedTodo)
+
+      // Remove resolved conflict
+      setConflicts(prev => prev.filter(c => c.todoId !== resolution.todoId))
+      
+      // Hide resolver if all conflicts resolved
+      if (conflicts.length <= 1) {
+        setShowConflictResolver(false)
+        setConflicts([])
+        
+        // Continue sync after resolution
+        setTimeout(() => fullSync(), 500)
+      }
+    } catch (error) {
+      console.error('Error resolving conflict:', error)
+    }
+  }, [conflicts, fullSync])
+
+  const dismissConflictResolver = useCallback(() => {
+    setShowConflictResolver(false)
+    // Keep conflicts in state so user can see them later
+  }, [])
+
+  // 🔥 FIX 7: Setup broadcast channel and listeners
   useEffect(() => {
-    // Setup BroadcastChannel to react to syncs from other tabs
     let bc: BroadcastChannel | null = null
+    
     try {
       if (typeof BroadcastChannel !== 'undefined') {
         bc = new BroadcastChannel('todo-sync')
         bc.onmessage = (ev) => {
-          try {
-            if (ev.data?.type === 'synced' || ev.data?.type === 'invalidate') {
-              // Another tab synced — refresh local view from server
-              fetchFromServer()
-            }
-          } catch (e) {
-            console.error('BC message handler error', e)
+          if (ev.data?.type === 'synced' || ev.data?.type === 'invalidate') {
+            console.log('📡 Other tab synced, refreshing...')
+            fetchFromServer(false)
           }
         }
         bcRef.current = bc
       }
     } catch (err) {
-      // ignore if BroadcastChannel unsupported
+      console.warn('BroadcastChannel not supported')
     }
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
-        fetchFromServer()
+        fetchFromServer(false)
       }
     }
 
-    const handleFocus = () => {
-      fetchFromServer()
-    }
+    const handleFocus = () => fetchFromServer(false)
 
     document.addEventListener('visibilitychange', handleVisibility)
     window.addEventListener('focus', handleFocus)
@@ -308,122 +286,61 @@ export const useSync = () => {
     }
   }, [fetchFromServer])
 
-  // Queue a todo for syncing
-  const queueForSync = useCallback((todoId: string) => {
-    syncQueueRef.current.add(todoId)
-    debouncedSync()
-  }, [debouncedSync])
-
-  // Handle conflict resolution
-  const handleConflictResolution = useCallback(async (resolution: any) => {
-    try {
-      // Apply the resolved todo to the collection
-      if (resolution.resolvedTodo) {
-        await todoCollection.update(resolution.todoId, () => resolution.resolvedTodo)
-      }
-
-      // Remove resolved conflict
-      setConflicts(prev => prev.filter(c => c.todoId !== resolution.todoId))
-      
-      // If all conflicts resolved, hide the resolver
-      if (conflicts.length <= 1) {
-        setShowConflictResolver(false)
-        setConflicts([])
-        // Continue with sync after resolving conflicts
-        setTimeout(() => {
-          fullSync()
-        }, 1000)
-      }
-    } catch (error) {
-      console.error('Error resolving conflict:', error)
-    }
-  }, [conflicts.length, fullSync])
-
-  // Dismiss conflict resolver
-  const dismissConflictResolver = useCallback(() => {
-    setShowConflictResolver(false)
-    setConflicts([])
-  }, [])
-
-  // Handle online/offline events
+  // 🔥 FIX 8: Online/offline handlers
   useEffect(() => {
     const handleOnline = async () => {
-      console.log('Back online!')
+      console.log('🟢 Back online!')
       setIsOnline(true)
       setSyncError(null)
 
-      // Check server health
       const isHealthy = await checkHealth()
       if (isHealthy) {
-        // Perform full sync when coming back online
-        setTimeout(() => {
-          fullSync()
-        }, 1000)
+        setTimeout(() => fullSync(false), 1000)
       }
-    }
-
-    // If health check fails we still want to attempt syncing after a short delay
-    // This helps when the health endpoint temporarily fails but the API is reachable
-    const handleOnlineFallback = async () => {
-      console.log('Back online (fallback) - attempting sync')
-      setIsOnline(true)
-      setSyncError(null)
-      setTimeout(() => {
-        fullSync()
-      }, 2000)
     }
 
     const handleOffline = () => {
-      console.log('Gone offline')
+      console.log('🔴 Gone offline')
       setIsOnline(false)
     }
 
-    // Handle force sync events
     const handleForceSync = () => {
-      console.log('Force sync triggered')
-      fullSync()
+      console.log('🔄 Force sync triggered')
+      fullSync(false)
     }
 
     window.addEventListener('online', handleOnline)
-  // Fallback listener in case health check blocks immediate sync
-  window.addEventListener('online', handleOnlineFallback)
     window.addEventListener('offline', handleOffline)
     window.addEventListener('force-sync', handleForceSync)
 
     return () => {
       window.removeEventListener('online', handleOnline)
-      window.removeEventListener('online', handleOnlineFallback)
       window.removeEventListener('offline', handleOffline)
       window.removeEventListener('force-sync', handleForceSync)
     }
   }, [fullSync])
 
-  // Auto-sync every 30 seconds when online
+  // 🔥 FIX 9: Auto-sync every 30 seconds (only if unsynced data exists)
   useEffect(() => {
-    if (!isOnline) return;
+    if (!isOnline) return
 
-    const interval = setInterval(() => {
-      // Wrap async logic in an IIFE
-      (async () => {
-        try {
-          // Access the raw Dexie table
-          const table = todoCollection.utils.getTable();
-          const allTodos = (await table.toArray()) as unknown as TodoType[];
-
-          // Check if there are unsynced todos
-          const hasUnsynced = allTodos.some(todo => !todo.synced);
-          if (hasUnsynced) {
-            syncToServer();
-          }
-        } catch (err) {
-          console.error('Error checking unsynced todos:', err);
+    const interval = setInterval(async () => {
+      try {
+        const table = todoCollection.utils.getTable()
+        const allTodos = (await table.toArray()) as unknown as TodoType[]
+        const hasUnsynced = allTodos.some(todo => !todo.synced)
+        
+        if (hasUnsynced) {
+          console.log('⏰ Auto-sync: unsynced data found')
+          syncToServer()
         }
-      })();
-    }, 30000);
+      } catch (err) {
+        console.error('Auto-sync check failed:', err)
+      }
+    }, 30000)
 
-    return () => clearInterval(interval);
-  }, [isOnline, syncToServer]);
-
+    return () => clearInterval(interval)
+  }, [isOnline, syncToServer])
 
   return {
     isOnline,
@@ -435,7 +352,6 @@ export const useSync = () => {
     syncToServer,
     fetchFromServer,
     fullSync,
-    queueForSync,
     handleConflictResolution,
     dismissConflictResolver
   }

@@ -11,6 +11,8 @@ import { UserSwitcher } from "../components/UserSwitcher";
 import { useSync } from "../hooks/useSync";
 import { getCurrentUser } from "../utils/userManager";
 import { Clipboard } from "lucide-react";
+import offlineQueue from '../utils/offlineQueue'
+import { requestBackgroundSync } from '../utils/serviceWorkerRegistration'
 
 export const TodoPage: React.FC = () => {
   const [newTodo, setNewTodo] = useState("");
@@ -20,8 +22,6 @@ export const TodoPage: React.FC = () => {
     q.from({ todo: todoCollection }).select(({ todo }) => ({ ...todo }))
   );
 
-  // Exclude deleted (tombstoned) todos from the UI list so they are
-  // still present locally for syncing but not shown to the user.
   const visibleTodos = todos.filter((t) => !t.deleted)
 
   const {
@@ -29,14 +29,15 @@ export const TodoPage: React.FC = () => {
     showConflictResolver,
     handleConflictResolution,
     dismissConflictResolver,
-    queueForSync
   } = useSync();
 
-  const addTodo = () => {
+  // 🔥 FIX: Simplified add todo with proper offline queue
+  const addTodo = async () => {
     if (!newTodo.trim()) return;
+    
     const now = new Date();
     const id = crypto.randomUUID()
-    todoCollection.insert({
+    const todoData = {
       id,
       text: newTodo.trim(),
       completed: false,
@@ -47,56 +48,158 @@ export const TodoPage: React.FC = () => {
       deleted: false,
       userId: currentUser.id,
       userName: currentUser.name,
-    });
+    }
+
+    // Insert into local DB immediately
+    await todoCollection.insert(todoData);
     setNewTodo("");
-    // Queue for sync (debounced)
-    try { queueForSync(id); console.log('Queued todo for sync', id) } catch (e) { try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
+
+    // Save to offline queue
+    try {
+      const op = { 
+        type: 'CREATE', 
+        todo: { 
+          ...todoData,
+          createdAt: todoData.createdAt.toISOString(),
+          updatedAt: todoData.updatedAt.toISOString()
+        } 
+      }
+      await offlineQueue.addOperation(op)
+      console.log('✅ Saved to offline queue')
+
+      // Request background sync (SW will handle when online)
+      await requestBackgroundSync('sync-todos')
+      
+      // Trigger immediate sync if online
+      if (navigator.onLine) {
+        window.dispatchEvent(new CustomEvent('force-sync'))
+      }
+    } catch (err) {
+      console.error('Failed to queue operation:', err)
+    }
   };
 
-  const toggleTodo = (todoRef: TodoType & { id: string }) => {
-    todoCollection.update(todoRef.id, (draft) => {
-      draft.completed = !draft.completed;
-      draft.version += 1;
-      draft.updatedAt = new Date();
-      draft.synced = false;
-      draft.userId = currentUser.id;
-      draft.userName = currentUser.name;
+  // 🔥 FIX: Simplified toggle todo
+  const toggleTodo = async (todoRef: TodoType & { id: string }) => {
+    const updatedData = {
+      completed: !todoRef.completed,
+      version: (todoRef.version || 0) + 1,
+      updatedAt: new Date(),
+      synced: false,
+      userId: currentUser.id,
+      userName: currentUser.name,
+    }
+
+    await todoCollection.update(todoRef.id, (draft) => {
+      Object.assign(draft, updatedData)
     });
-    try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (e) { /* noop */ }
+
+    try {
+      const op = { 
+        type: 'UPDATE', 
+        todo: { 
+          id: todoRef.id, 
+          completed: updatedData.completed,
+          version: updatedData.version,
+          updatedAt: updatedData.updatedAt.toISOString()
+        } 
+      }
+      await offlineQueue.addOperation(op)
+      await requestBackgroundSync('sync-todos')
+      
+      if (navigator.onLine) {
+        window.dispatchEvent(new CustomEvent('force-sync'))
+      }
+    } catch (err) {
+      console.error('Failed to queue toggle operation:', err)
+    }
   };
 
+  // 🔥 FIX: Simplified delete todo (tombstone)
   const deleteTodo = async (id: string) => {
-    const currentUserLocal = getCurrentUser()
-    // Mark as deleted (tombstone) so sync will send a DELETE op to server.
+    const updatedData = {
+      deleted: true,
+      synced: false,
+      version: 0, // Will be incremented in update
+      updatedAt: new Date(),
+      userId: currentUser.id,
+      userName: currentUser.name,
+    }
+
     await todoCollection.update(id, (draft) => {
       draft.deleted = true
       draft.synced = false
       draft.version = (draft.version || 0) + 1
-      draft.updatedAt = new Date()
-      draft.userId = currentUserLocal.id
-      draft.userName = currentUserLocal.name
+      draft.updatedAt = updatedData.updatedAt
+      draft.userId = updatedData.userId
+      draft.userName = updatedData.userName
     })
-    // Queue for sync (debounced) rather than forcing immediate sync event
-    try { queueForSync(id) } catch (e) { /* fallback to force-sync */ try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
+
+    try {
+      const op = { 
+        type: 'DELETE', 
+        todo: { 
+          id,
+          deleted: true,
+          updatedAt: updatedData.updatedAt.toISOString()
+        } 
+      }
+      await offlineQueue.addOperation(op)
+      await requestBackgroundSync('sync-todos')
+      
+      if (navigator.onLine) {
+        window.dispatchEvent(new CustomEvent('force-sync'))
+      }
+    } catch (err) {
+      console.error('Failed to queue delete operation:', err)
+    }
   };
 
+  // 🔥 FIX: Simplified edit todo
   const editTodo = async (id: string, newText: string) => {
     if (!newText.trim()) return;
-    const currentUserLocal = getCurrentUser();
+    
+    const updatedData = {
+      text: newText.trim(),
+      version: 0, // Will be calculated
+      updatedAt: new Date(),
+      synced: false,
+      userId: currentUser.id,
+      userName: currentUser.name,
+    }
+
     await todoCollection.update(id, (draft) => {
-      draft.text = newText.trim();
-      draft.version = (draft.version || 0) + 1;
-      draft.updatedAt = new Date();
-      draft.synced = false;
-      draft.userId = currentUserLocal.id;
-      draft.userName = currentUserLocal.name;
+      draft.text = updatedData.text
+      draft.version = (draft.version || 0) + 1
+      draft.updatedAt = updatedData.updatedAt
+      draft.synced = false
+      draft.userId = updatedData.userId
+      draft.userName = updatedData.userName
     });
-    try { queueForSync(id) } catch (e) { try { window.dispatchEvent(new CustomEvent('force-sync')) } catch (err) { /* noop */ } }
+
+    try {
+      const op = { 
+        type: 'UPDATE', 
+        todo: { 
+          id, 
+          text: updatedData.text,
+          updatedAt: updatedData.updatedAt.toISOString()
+        } 
+      }
+      await offlineQueue.addOperation(op)
+      await requestBackgroundSync('sync-todos')
+      
+      if (navigator.onLine) {
+        window.dispatchEvent(new CustomEvent('force-sync'))
+      }
+    } catch (err) {
+      console.error('Failed to queue edit operation:', err)
+    }
   }
 
   const unsyncedCount = todos.filter((t) => !t.synced).length;
 
-  if (isLoading)
+  if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-indigo-50 via-white to-cyan-50">
         <div className="flex flex-col items-center space-y-4">
@@ -110,8 +213,9 @@ export const TodoPage: React.FC = () => {
         </div>
       </div>
     );
+  }
 
-  if (isError)
+  if (isError) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-red-50 to-orange-50">
         <div className="bg-white/90 backdrop-blur-xl border border-red-200/50 rounded-3xl p-10 shadow-2xl text-center max-w-md">
@@ -125,6 +229,7 @@ export const TodoPage: React.FC = () => {
         </div>
       </div>
     );
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-cyan-50 py-10 px-4">
@@ -139,7 +244,6 @@ export const TodoPage: React.FC = () => {
           </h1>
           <p className="text-gray-600 text-lg mb-6">Stay productive with offline-first todos ✨</p>
           
-          {/* Network Status and User Switcher */}
           <div className="flex justify-center items-center gap-4 flex-wrap">
             <NetworkStatus />
             <UserSwitcher />
@@ -179,12 +283,12 @@ export const TodoPage: React.FC = () => {
         </div>
 
         {/* Stats */}
-  {visibleTodos.length > 0 && (
+        {visibleTodos.length > 0 && (
           <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-6">
             {[
-              { label: "Total", value: todos.length, color: "text-blue-600", bg: "from-blue-50 to-blue-100", icon: "📊" },
-              { label: "Active", value: todos.filter((t) => !t.completed).length, color: "text-green-600", bg: "from-green-50 to-emerald-100", icon: "⚡" },
-              { label: "Completed", value: todos.filter((t) => t.completed).length, color: "text-purple-600", bg: "from-purple-50 to-violet-100", icon: "✅" },
+              { label: "Total", value: visibleTodos.length, color: "text-blue-600", bg: "from-blue-50 to-blue-100", icon: "📊" },
+              { label: "Active", value: visibleTodos.filter((t) => !t.completed).length, color: "text-green-600", bg: "from-green-50 to-emerald-100", icon: "⚡" },
+              { label: "Completed", value: visibleTodos.filter((t) => t.completed).length, color: "text-purple-600", bg: "from-purple-50 to-violet-100", icon: "✅" },
               { label: "Pending", value: unsyncedCount, color: "text-amber-600", bg: "from-amber-50 to-orange-100", icon: "⏳" },
             ].map((stat, i) => (
               <div

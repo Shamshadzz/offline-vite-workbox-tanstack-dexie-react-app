@@ -1,4 +1,4 @@
-import { Todo as TodoType, ConflictInfo, User } from '../types/types'
+import { Todo as TodoType, ConflictInfo } from '../types/types'
 
 export type ConflictResolutionStrategy = 
   | 'server-wins'
@@ -13,7 +13,7 @@ export interface EnhancedConflictInfo extends ConflictInfo {
 }
 
 /**
- * Detect conflicts between local and server versions with user information
+ * 🔥 FIX: Improved conflict detection with better version checking
  */
 export function detectConflicts(
   localTodos: TodoType[],
@@ -24,6 +24,9 @@ export function detectConflicts(
   const conflicts: EnhancedConflictInfo[] = []
 
   for (const localTodo of localTodos) {
+    // Skip if local is already synced (no conflict possible)
+    if (localTodo.synced) continue
+
     const serverTodo = serverTodos.find(t => t.id === localTodo.id)
 
     if (!serverTodo) {
@@ -31,10 +34,14 @@ export function detectConflicts(
       continue
     }
 
-    // Check for conflicts
-    if (localTodo.version !== serverTodo.version && !localTodo.synced) {
-      // Version mismatch - potential conflict
-      
+    // 🔥 Conflict exists if versions differ AND local is unsynced
+    const hasVersionConflict = localTodo.version !== serverTodo.version
+    const hasContentConflict = 
+      localTodo.text !== serverTodo.text ||
+      localTodo.completed !== serverTodo.completed
+
+    if (hasVersionConflict || hasContentConflict) {
+      // Deletion conflict
       if (localTodo.deleted && !serverTodo.deleted) {
         conflicts.push({
           todoId: localTodo.id,
@@ -45,10 +52,9 @@ export function detectConflicts(
           serverUser,
           conflictTimestamp: new Date()
         })
-      } else if (
-        localTodo.text !== serverTodo.text ||
-        localTodo.completed !== serverTodo.completed
-      ) {
+      }
+      // Content conflict
+      else if (hasContentConflict) {
         conflicts.push({
           todoId: localTodo.id,
           localVersion: localTodo,
@@ -58,7 +64,9 @@ export function detectConflicts(
           serverUser,
           conflictTimestamp: new Date()
         })
-      } else if (localTodo.version < serverTodo.version) {
+      }
+      // Version conflict
+      else if (hasVersionConflict) {
         conflicts.push({
           todoId: localTodo.id,
           localVersion: localTodo,
@@ -76,7 +84,7 @@ export function detectConflicts(
 }
 
 /**
- * Resolve a single conflict based on strategy
+ * 🔥 FIX: Improved conflict resolution
  */
 export function resolveConflict(
   conflict: ConflictInfo,
@@ -84,41 +92,51 @@ export function resolveConflict(
 ): TodoType {
   switch (strategy) {
     case 'server-wins':
-      return { ...conflict.serverVersion, synced: true }
+      return { 
+        ...conflict.serverVersion, 
+        synced: true,
+        updatedAt: new Date()
+      }
 
     case 'client-wins':
       return { 
         ...conflict.localVersion, 
-        version: conflict.serverVersion.version + 1,
-        synced: false 
+        version: Math.max(conflict.serverVersion.version, conflict.localVersion.version) + 1,
+        synced: false,
+        updatedAt: new Date()
       }
 
-    case 'last-write-wins':
+    case 'last-write-wins': {
       const localTime = conflict.localVersion.updatedAt?.getTime() ?? 0
       const serverTime = conflict.serverVersion.updatedAt?.getTime() ?? 0
       
       if (localTime > serverTime) {
         return { 
           ...conflict.localVersion, 
-          version: conflict.serverVersion.version + 1,
-          synced: false 
+          version: Math.max(conflict.serverVersion.version, conflict.localVersion.version) + 1,
+          synced: false,
+          updatedAt: new Date()
         }
       } else {
-        return { ...conflict.serverVersion, synced: true }
+        return { 
+          ...conflict.serverVersion, 
+          synced: true,
+          updatedAt: new Date()
+        }
       }
+    }
 
     case 'manual':
-      // Return local version for manual resolution
-      // The app should prompt the user
+      // Return local version for manual resolution UI
       return conflict.localVersion
 
     default:
-      return conflict.serverVersion
+      return { ...conflict.serverVersion, synced: true }
   }
 }
 
 /**
- * Merge todos with conflict resolution
+ * 🔥 Enhanced merge with proper conflict handling
  */
 export function mergeTodos(
   localTodos: TodoType[],
@@ -135,11 +153,9 @@ export function mergeTodos(
   const resolutions = new Map<string, TodoType>()
   const merged: TodoType[] = []
 
-  // Create a map of local todos
   const localMap = new Map(localTodos.map(t => [t.id, t]))
   const serverMap = new Map(serverTodos.map(t => [t.id, t]))
 
-  // Process all unique todo IDs
   const allIds = new Set([
     ...localTodos.map(t => t.id),
     ...serverTodos.map(t => t.id)
@@ -151,15 +167,16 @@ export function mergeTodos(
     const conflict = conflicts.find(c => c.todoId === id)
 
     if (conflict) {
-      // Resolve conflict
+      // Resolve conflict using strategy
       const resolved = resolveConflict(conflict, strategy)
       resolutions.set(id, resolved)
       merged.push(resolved)
     } else if (localTodo && serverTodo) {
-      // No conflict - prefer server version if local is synced
+      // No conflict - prefer synced version or server
       if (localTodo.synced) {
         merged.push({ ...serverTodo, synced: true })
       } else {
+        // Local has unsynced changes, keep them
         merged.push(localTodo)
       }
     } else if (localTodo) {
@@ -175,7 +192,7 @@ export function mergeTodos(
 }
 
 /**
- * Three-way merge for advanced conflict resolution
+ * 🔥 Three-way merge for advanced conflict resolution
  */
 export function threeWayMerge(
   base: TodoType | null,
@@ -186,7 +203,14 @@ export function threeWayMerge(
   if (!base) {
     const localTime = local.updatedAt?.getTime() ?? 0
     const remoteTime = remote.updatedAt?.getTime() ?? 0
-    return localTime > remoteTime ? local : remote
+    
+    const winner = localTime > remoteTime ? local : remote
+    return {
+      ...winner,
+      version: Math.max(local.version, remote.version) + 1,
+      updatedAt: new Date(),
+      synced: false
+    }
   }
 
   // Field-by-field merge
